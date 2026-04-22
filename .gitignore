@@ -3,3 +3,28 @@
 .import/
 export/
 *.tmp
+# --- Godot 4 specific ---
+.godot/
+
+# --- Godot 3 specific ---
+.import/
+
+# --- Large/Auto-generated Assets ---
+# These are built from your source assets; no need to track them.
+*.translation
+
+# --- Exported Binaries ---
+# Don't track the actual games you build (the .exe, .apk, .zip, etc.)
+export/
+bin/
+
+# --- User-specific files ---
+# These store YOUR window layout and local editor settings.
+# Tracking these causes annoying conflicts when working with others.
+.mono/
+data_*/
+mono_crash*.log
+
+# --- System files ---
+.DS_Store
+Thumbs.db
