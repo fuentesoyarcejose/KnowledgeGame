@@ -43,8 +43,14 @@ var _generate_map := false
 
 @export var river_depth: float = 10.0
 @export var river_width: float = 20.0
+@export_range(0.0, 1.0, 0.01) var river_width_variation: float = 0.4
+@export_range(0.1, 8.0, 0.1) var river_width_noise_frequency: float = 2.0
+@export var river_min_width: float = 6.0
 @export var river_ground_band: float = 5.0
 @export var water_level_offset: float = 1.0
+@export_range(0, 8, 1) var river_curve_iterations: int = 5
+@export var river_curve_strength: float = 8.0
+@export_range(0.1, 8.0, 0.1) var river_curve_noise_frequency: float = 1.5
 
 var _frequency := 0.02
 @export_range(0.001, 0.5, 0.001) var frequency: float:
@@ -79,6 +85,7 @@ var _gain := 0.5
 var _astar: AStar3D = null
 var _astar_cols: int = 0
 var _road_path: PackedVector3Array = []
+var _river_path: PackedVector3Array = []
 var _road_points: Array[Vector3] = [Vector3.ZERO, Vector3.ZERO]
 
 var _seed: int = 0
@@ -155,9 +162,15 @@ func build_astar() -> void:
 					if nr < 0 or nr >= _astar_cols or nc < 0 or nc >= _astar_cols:
 						continue
 					var nid := _astar_id(nr, nc)
-					if _astar.has_point(nid) and not _astar.are_points_connected(id, nid):
+					if not _astar.has_point(nid):
+						continue
+					if not _astar.are_points_connected(id, nid):
 						_astar.connect_points(id, nid)
-
+					
+					var pos_b : Vector3 = _astar.get_point_position(nid)
+					var neighbor_h : float = get_height(pos_b.x, pos_b.z)
+					var weight : float = 1 + max(0.0, neighbor_h - ground_level) * 0.5
+					_astar.set_point_weight_scale(nid, weight)
 
 func _dist_point_to_segment_2d(p: Vector2, a: Vector2, b: Vector2) -> float:
 	var ab := b - a
@@ -168,17 +181,37 @@ func _dist_point_to_segment_2d(p: Vector2, a: Vector2, b: Vector2) -> float:
 	return p.distance_to(a + ab * t)
 
 
-func _dist_to_river_path(xz: Vector2) -> float:
-	if _road_path.size() < 2:
-		return INF
-	var min_dist := INF
-	for i in _road_path.size() - 1:
-		var a := Vector2(_road_path[i].x, _road_path[i].z)
-		var b := Vector2(_road_path[i + 1].x, _road_path[i + 1].z)
-		var d := _dist_point_to_segment_2d(xz, a, b)
+func _river_half_width_at_u(u: float) -> float:
+	var base_half: float = max(river_min_width * 0.5, river_width * 0.5)
+	if river_width_variation <= 0.0:
+		return base_half
+	var n: float = 0.0
+	if noise:
+		n = noise.get_noise_1d(u * river_width_noise_frequency + float(_seed) * 0.013)
+	var width_scale: float = 1.0 + n * river_width_variation
+	return max(river_min_width * 0.5, base_half * width_scale)
+
+
+func _closest_river_info(xz: Vector2) -> Dictionary:
+	if _river_path.size() < 2:
+		return {"dist": INF, "u": 0.0}
+	var min_dist: float = INF
+	var best_u: float = 0.0
+	var denom: float = max(1.0, float(_river_path.size() - 1))
+	for i in _river_path.size() - 1:
+		var a := Vector2(_river_path[i].x, _river_path[i].z)
+		var b := Vector2(_river_path[i + 1].x, _river_path[i + 1].z)
+		var ab := b - a
+		var len_sq := ab.dot(ab)
+		var t: float = 0.0
+		if len_sq >= 0.0001:
+			t = clamp((xz - a).dot(ab) / len_sq, 0.0, 1.0)
+		var p := a + ab * t
+		var d := xz.distance_to(p)
 		if d < min_dist:
 			min_dist = d
-	return min_dist
+			best_u = (float(i) + t) / denom
+	return {"dist": min_dist, "u": best_u}
 
 
 func _draw_road(path: PackedVector3Array) -> void:
@@ -187,7 +220,6 @@ func _draw_road(path: PackedVector3Array) -> void:
 		road.mesh = null
 		return
 
-	path = _smooth_path_chaikin(path)
 	var lifted := PackedVector3Array()
 	for p in path:
 		lifted.append(Vector3(p.x, ground_level - river_depth, p.z))
@@ -222,15 +254,35 @@ func _smooth_path_chaikin(path: PackedVector3Array, iterations: int = 4) -> Pack
 	return result
 
 
+func _make_river_curvier(path: PackedVector3Array) -> PackedVector3Array:
+	if path.size() < 3:
+		return path
+	var curved := _smooth_path_chaikin(path, river_curve_iterations)
+	if river_curve_strength <= 0.0:
+		return curved
+	for i in range(1, curved.size() - 1):
+		var prev := curved[i - 1]
+		var next := curved[i + 1]
+		var forward := Vector3(next.x - prev.x, 0.0, next.z - prev.z)
+		if forward.length_squared() < 0.0001:
+			continue
+		forward = forward.normalized()
+		var right := Vector3(-forward.z, 0.0, forward.x)
+		var u := float(i) / float(curved.size() - 1)
+		var n: float = 0.0
+		if noise:
+			n = noise.get_noise_1d(u * river_curve_noise_frequency + float(_seed) * 0.021 + 17.0)
+		curved[i] += right * (n * river_curve_strength)
+	return _smooth_path_chaikin(curved, 1)
+
+
 func _draw_water(path: PackedVector3Array) -> void:
 	var water := _get_or_create_marker("RiverWater")
 	if path.size() < 2:
 		water.mesh = null
 		return
 
-	path = _smooth_path_chaikin(path, 6)
 	var water_y  := ground_level - water_level_offset
-	var half_w   := river_width * 0.45 
 	var n        := path.size()
 
 	var verts   := PackedVector3Array()
@@ -252,11 +304,12 @@ func _draw_water(path: PackedVector3Array) -> void:
 
 		var right := Vector3(-fwd.z, 0.0, fwd.x)
 
+		var u := float(i) / float(max(1, n - 1))
+		var half_w := _river_half_width_at_u(u)
 		verts.append(p - right * half_w)
 		verts.append(p + right * half_w)
 		normals.append(Vector3.UP)
 		normals.append(Vector3.UP)
-		var u := float(i) / float(n - 1)
 		uvs.append(Vector2(0.0, u))
 		uvs.append(Vector2(1.0, u))
 
@@ -339,6 +392,7 @@ func _get_or_create_marker(marker_name: String) -> MeshInstance3D:
 
 func _find_road() -> void:
 	_road_path = []
+	_river_path = []
 	_road_points = [Vector3.ZERO, Vector3.ZERO]
 	var max_retries := 100
 	var rng := RandomNumberGenerator.new()
@@ -355,6 +409,7 @@ func _find_road() -> void:
 			continue
 		_road_path = _astar.get_point_path(a_id, b_id)
 		if _road_path.size() > 0:
+			_river_path = _make_river_curvier(_road_path)
 			_road_points = points
 			break
 
@@ -376,8 +431,8 @@ func update_edge_marker() -> void:
 		xform.origin = _road_points[i]
 		marker.transform = xform
 
-	_draw_road(_road_path)
-	_draw_water(_road_path)
+	_draw_road(_river_path)
+	_draw_water(_river_path)
 
 
 func _on_map_gen_button_pressed() -> void:
@@ -400,10 +455,8 @@ func update_mesh() -> void:
 	var tangent_arrays : PackedFloat32Array= plane_arrays[ArrayMesh.ARRAY_TANGENT]
 	var uv_arrays : PackedVector2Array= plane_arrays[ArrayMesh.ARRAY_TEX_UV]
 
-	var half_width     := river_width * 0.5
-	var total_radius   := half_width + river_ground_band
 	var river_floor    := ground_level - river_depth
-	var has_river      := _road_path.size() >= 2
+	var has_river      := _river_path.size() >= 2
 
 	for i: int in vertex_arrays.size():
 		var vertex : Vector3 = vertex_arrays[i]
@@ -415,19 +468,24 @@ func update_mesh() -> void:
 			# Gram-Schmidt: project world-X onto the surface plane for a stable tangent
 			tangent  = (Vector3.RIGHT - normal * normal.dot(Vector3.RIGHT)).normalized()
 
-		if has_river:
-			var dist := _dist_to_river_path(Vector2(vertex.x, vertex.z))
+		if has_river and noise:
+			var river_info : Dictionary = _closest_river_info(Vector2(vertex.x, vertex.z))
+			var dist: float = river_info["dist"]
+			var half_width : float = _river_half_width_at_u(river_info["u"])
+			
+			var height_diff : float = max(0.0, vertex.y - river_floor)
+
+			var adaptive_bank : float = max(river_ground_band, height_diff * 1.5)
+			var total_radius : float = half_width + adaptive_bank
+
 			if dist < half_width:
-				# Flat river bed
 				vertex.y = river_floor
 				normal   = Vector3.UP
 				tangent  = Vector3.RIGHT
 			elif dist < total_radius:
-				# Smooth bank: blend from river floor up to natural terrain height
-				var t := (dist - half_width) / river_ground_band
-				t = smoothstep(0.0, 1.0, t)
+				var t : float = (dist - half_width) / adaptive_bank
+				t = t * t * (3.0 - 2.0 * t)
 				vertex.y = lerpf(river_floor, vertex.y, t)
-				# Leave normal as the terrain normal; close enough for a gentle slope
 
 		vertex_arrays[i] = vertex
 		normal_arrays[i] = normal
