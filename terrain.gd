@@ -2,6 +2,9 @@
 extends MeshInstance3D
 class_name TerrainMesh
 
+@export var terrain_shader: Shader = preload("res://terrainShader.gdshader")
+var _terrain_material: ShaderMaterial = null
+
 @export var terrain_size := 1000.0;
 @export_range(4, 512,4) var resolution:= 32:
 	set(new_resolution):
@@ -32,7 +35,8 @@ var _generate_map := false
 @export_range(4.0, 128.0, 4.0) var height := 64.0:
 	set(new_height):
 		height = new_height
-		material_override.set_shader_parameter("height", height * 2.0)
+		if _terrain_material:
+			_terrain_material.set_shader_parameter("height", height * 2.0)
 		update_mesh()
 
 @export_range(-256.0, 256.0, 1.0) var ground_level: float = 0.0
@@ -87,6 +91,17 @@ var _seed: int = 0
 			noise.seed = _seed
 		update_mesh()
 
+func _ensure_terrain_material() -> void:
+	if not terrain_shader:
+		push_warning("TerrainMesh: terrain_shader is not set.")
+		return
+	if _terrain_material == null:
+		_terrain_material = ShaderMaterial.new()
+	if _terrain_material.shader != terrain_shader:
+		_terrain_material.shader = terrain_shader
+	_terrain_material.set_shader_parameter("height", height * 2.0)
+	_terrain_material.set_shader_parameter("ground_level", ground_level)
+
 func get_height(x: float, y: float) -> float:
 	var step := terrain_size / float(resolution)
 	var n00 := noise.get_noise_2d(x, y)
@@ -94,12 +109,8 @@ func get_height(x: float, y: float) -> float:
 	var n_10 := noise.get_noise_2d(x - step, y)
 	var n01 := noise.get_noise_2d(x, y + step)
 	var n0_1 := noise.get_noise_2d(x, y - step)
-
-	# Simple 5-sample blur: center weighted more than neighbors
 	var n := (n00 * 4.0 + n10 + n_10 + n01 + n0_1) / 8.0
-	# Raise blended noise to the 4th power (preserve sign) for sharper peaks/valleys
 	var h := n * height
-	# Clamp everything below ground_level up to a flat ground plateau
 	if h < ground_level:
 		h = ground_level
 	return h
@@ -217,10 +228,10 @@ func _draw_water(path: PackedVector3Array) -> void:
 		water.mesh = null
 		return
 
-	path = _smooth_path_chaikin(path)
-	var water_y := ground_level - water_level_offset
-	var half_w  := river_width * 0.5
-	var n       := path.size()
+	path = _smooth_path_chaikin(path, 6)
+	var water_y  := ground_level - water_level_offset
+	var half_w   := river_width * 0.45 
+	var n        := path.size()
 
 	var verts   := PackedVector3Array()
 	var normals := PackedVector3Array()
@@ -232,14 +243,13 @@ func _draw_water(path: PackedVector3Array) -> void:
 
 		var fwd := Vector3.ZERO
 		if i < n - 1:
-			fwd += Vector3(path[i + 1].x - path[i].x, 0.0, path[i + 1].z - path[i].z)
+			fwd += Vector3(path[i+1].x - path[i].x, 0.0, path[i+1].z - path[i].z)
 		if i > 0:
-			fwd += Vector3(path[i].x - path[i - 1].x, 0.0, path[i].z - path[i - 1].z)
+			fwd += Vector3(path[i].x - path[i-1].x, 0.0, path[i].z - path[i-1].z)
 		if fwd.length_squared() < 0.0001:
 			fwd = Vector3.FORWARD
 		fwd = fwd.normalized()
 
-		# Perpendicular in XZ plane
 		var right := Vector3(-fwd.z, 0.0, fwd.x)
 
 		verts.append(p - right * half_w)
@@ -252,28 +262,29 @@ func _draw_water(path: PackedVector3Array) -> void:
 
 	for i in n - 1:
 		var base := i * 2
-		indices.append(base);     indices.append(base + 1); indices.append(base + 2)
-		indices.append(base + 1); indices.append(base + 3); indices.append(base + 2)
+		indices.append(base);     indices.append(base + 2); indices.append(base + 1)
+		indices.append(base + 1); indices.append(base + 2); indices.append(base + 3)
 
 	var arrays := []
 	arrays.resize(ArrayMesh.ARRAY_MAX)
-	arrays[ArrayMesh.ARRAY_VERTEX] = verts
-	arrays[ArrayMesh.ARRAY_NORMAL] = normals
-	arrays[ArrayMesh.ARRAY_TEX_UV] = uvs
-	arrays[ArrayMesh.ARRAY_INDEX]  = indices
+	arrays[ArrayMesh.ARRAY_VERTEX]  = verts
+	arrays[ArrayMesh.ARRAY_NORMAL]  = normals
+	arrays[ArrayMesh.ARRAY_TEX_UV]  = uvs
+	arrays[ArrayMesh.ARRAY_INDEX]   = indices
 
 	var arr_mesh := ArrayMesh.new()
 	arr_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color        = Color(0.08, 0.38, 0.74, 0.78)
-	mat.transparency        = BaseMaterial3D.TRANSPARENCY_ALPHA
-	mat.roughness           = 0.05
-	mat.metallic            = 0.0
-	mat.metallic_specular   = 0.9
-	mat.cull_mode           = BaseMaterial3D.CULL_DISABLED
-	arr_mesh.surface_set_material(0, mat)
+	var mat := ShaderMaterial.new()
+	mat.shader = preload("res://RiverWater.gdshader")
 
+	mat.set_shader_parameter("flow_speed",    0.35)
+	mat.set_shader_parameter("flow_direction", Vector2(1.0, 0.2))
+	mat.set_shader_parameter("tiling",         5.0)
+	mat.set_shader_parameter("depth_scale",    4.0)
+	mat.set_shader_parameter("normal_strength", 0.65)
+
+	arr_mesh.surface_set_material(0, mat)
 	water.mesh = arr_mesh
 
 
@@ -374,6 +385,7 @@ func _on_map_gen_button_pressed() -> void:
 	update_mesh()
 
 func update_mesh() -> void:
+	_ensure_terrain_material()
 	build_astar()
 	_find_road()
 
@@ -428,5 +440,6 @@ func update_mesh() -> void:
 	var array_mesh := ArrayMesh.new()
 	array_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, plane_arrays)
 	mesh = array_mesh
-
+	if _terrain_material:
+		material_override = _terrain_material
 	update_edge_marker()
