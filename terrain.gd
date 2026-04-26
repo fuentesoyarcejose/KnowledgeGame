@@ -4,12 +4,15 @@ class_name TerrainMesh
 
 @export var terrain_shader: Shader = preload("res://terrainShader.gdshader")
 var _terrain_material: ShaderMaterial = null
+const EDITOR_REBUILD_DEBOUNCE_SEC: float = 0.2
+var _editor_rebuild_timer: Timer = null
 
 @export var terrain_size := 1000.0;
 @export_range(4, 512,4) var resolution:= 32:
 	set(new_resolution):
 		resolution = new_resolution
-		update_mesh()
+		_queue_update_mesh()
+@export_range(4, 128, 4) var editor_preview_resolution: int = 16
 
 var _generate_map := false
 @export var generate_map: bool:
@@ -18,8 +21,33 @@ var _generate_map := false
 	set(value):
 		_generate_map = value
 		if value:
-			update_mesh()
+			_queue_update_mesh()
 			_generate_map = false
+
+var _generate_rivers_only := false
+@export var generate_rivers_only: bool:
+	get:
+		return _generate_rivers_only
+	set(value):
+		_generate_rivers_only = value
+		if value:
+			# Force a clean river pass: clear previous layout, then rebuild mesh/rivers.
+			_river_paths.clear()
+			_river_points.clear()
+			update_mesh(false)
+			_generate_rivers_only = false
+
+var _generate_height_only := false
+@export var generate_height_only: bool:
+	get:
+		return _generate_height_only
+	set(value):
+		_generate_height_only = value
+		if value:
+			update_mesh(false)
+			_generate_height_only = false
+
+@export var freeze_river_layout_for_testing: bool = false
 
 @export var noise: FastNoiseLite:
 	set(new_noise):
@@ -29,24 +57,27 @@ var _generate_map := false
 			noise.frequency = _frequency
 			noise.fractal_lacunarity = _lacunarity
 			noise.fractal_gain = _gain
-			noise.changed.connect(update_mesh)
-		update_mesh()
+			if not noise.changed.is_connected(_queue_update_mesh):
+				noise.changed.connect(_queue_update_mesh)
+		_queue_update_mesh()
 
 @export_range(4.0, 128.0, 4.0) var height := 64.0:
 	set(new_height):
 		height = new_height
 		if _terrain_material:
 			_terrain_material.set_shader_parameter("height", height * 2.0)
-		update_mesh()
+		_queue_update_mesh()
 
 @export_range(-256.0, 256.0, 1.0) var ground_level: float = 0.0
 
 @export var river_depth: float = 10.0
+@export_range(1, 8, 1) var river_count: int = 2
 @export var river_width: float = 20.0
 @export_range(0.0, 1.0, 0.01) var river_width_variation: float = 0.4
 @export_range(0.1, 8.0, 0.1) var river_width_noise_frequency: float = 2.0
 @export var river_min_width: float = 6.0
 @export var river_ground_band: float = 5.0
+@export var river_terrain_influence: float = 3.0
 @export var water_level_offset: float = 1.0
 @export_range(0, 8, 1) var river_curve_iterations: int = 5
 @export var river_curve_strength: float = 8.0
@@ -60,7 +91,7 @@ var _frequency := 0.02
 		_frequency = value
 		if noise:
 			noise.frequency = _frequency
-		update_mesh()
+		_queue_update_mesh()
 
 var _lacunarity := 2.0
 @export_range(1.0, 4.0, 0.01) var lacunarity: float:
@@ -70,7 +101,7 @@ var _lacunarity := 2.0
 		_lacunarity = value
 		if noise:
 			noise.fractal_lacunarity = _lacunarity
-		update_mesh()
+		_queue_update_mesh()
 
 var _gain := 0.5
 @export_range(0.0, 1.0, 0.01) var gain: float:
@@ -80,13 +111,17 @@ var _gain := 0.5
 		_gain = value
 		if noise:
 			noise.fractal_gain = _gain
-		update_mesh()
+		_queue_update_mesh()
 
 var _astar: AStar3D = null
 var _astar_cols: int = 0
-var _road_path: PackedVector3Array = []
-var _river_path: PackedVector3Array = []
-var _road_points: Array[Vector3] = [Vector3.ZERO, Vector3.ZERO]
+var _river_paths: Array[PackedVector3Array] = []
+var _river_points: Array[Array] = []
+var _river_influence_cache: PackedFloat32Array = PackedFloat32Array()
+var _river_cache_cols: int = 0
+var _river_cache_step: float = 0.0
+var _river_cache_half: float = 0.0
+var _river_cache_valid: bool = false
 
 var _seed: int = 0
 @export var seed: int:
@@ -96,7 +131,37 @@ var _seed: int = 0
 		_seed = value
 		if noise:
 			noise.seed = _seed
+		_queue_update_mesh()
+
+func _ready() -> void:
+	if Engine.is_editor_hint():
+		if _editor_rebuild_timer == null:
+			_editor_rebuild_timer = Timer.new()
+			_editor_rebuild_timer.one_shot = true
+			_editor_rebuild_timer.wait_time = EDITOR_REBUILD_DEBOUNCE_SEC
+			add_child(_editor_rebuild_timer)
+		if not _editor_rebuild_timer.timeout.is_connected(_on_editor_rebuild_timeout):
+			_editor_rebuild_timer.timeout.connect(_on_editor_rebuild_timeout)
+
+
+func _on_editor_rebuild_timeout() -> void:
+	update_mesh()
+
+
+func _queue_update_mesh() -> void:
+	if not Engine.is_editor_hint():
 		update_mesh()
+		return
+	if _editor_rebuild_timer == null:
+		_ready()
+	if _editor_rebuild_timer:
+		_editor_rebuild_timer.start()
+
+
+func _get_active_resolution() -> int:
+	if Engine.is_editor_hint():
+		return max(4, editor_preview_resolution)
+	return max(4, resolution)
 
 func _ensure_terrain_material() -> void:
 	if not terrain_shader:
@@ -110,7 +175,12 @@ func _ensure_terrain_material() -> void:
 	_terrain_material.set_shader_parameter("ground_level", ground_level)
 
 func get_height(x: float, y: float) -> float:
-	var step := terrain_size / float(resolution)
+
+	#Safety check if noise is null
+	if noise == null:
+		return ground_level
+	var active_resolution: int = _get_active_resolution()
+	var step := terrain_size / float(active_resolution)
 	var n00 := noise.get_noise_2d(x, y)
 	var n10 := noise.get_noise_2d(x + step, y)
 	var n_10 := noise.get_noise_2d(x - step, y)
@@ -123,7 +193,8 @@ func get_height(x: float, y: float) -> float:
 	return h
 
 func get_normal(x: float, y: float) -> Vector3:
-	var epsilon := terrain_size / resolution
+	var active_resolution: int = _get_active_resolution()
+	var epsilon := terrain_size / float(active_resolution)
 	var dh_dx := (get_height(x + epsilon, y) - get_height(x - epsilon, y)) / (2.0 * epsilon)
 	var dh_dz := (get_height(x, y + epsilon) - get_height(x, y - epsilon)) / (2.0 * epsilon)
 	# Height-field normal: cross(dP/dx, dP/dz) = (-dh/dx, 1, -dh/dz)
@@ -136,17 +207,16 @@ func _astar_id(row: int, col: int) -> int:
 
 func build_astar() -> void:
 	_astar = AStar3D.new()
-	_astar_cols = resolution + 1
+	var active_resolution: int = _get_active_resolution()
+	_astar_cols = active_resolution + 1
 	var half := terrain_size * 0.5
-	var step := terrain_size / float(resolution)
+	var step := terrain_size / float(active_resolution)
 
 	for row in _astar_cols:
 		for col in _astar_cols:
 			var x := -half + col * step
 			var z := -half + row * step
-			var h := get_height(x, z) if noise else ground_level
-			if h == ground_level:
-				_astar.add_point(_astar_id(row, col), Vector3(x, ground_level, z))
+			_astar.add_point(_astar_id(row, col), Vector3(x, ground_level, z))
 
 	for row in _astar_cols:
 		for col in _astar_cols:
@@ -162,14 +232,14 @@ func build_astar() -> void:
 					if nr < 0 or nr >= _astar_cols or nc < 0 or nc >= _astar_cols:
 						continue
 					var nid := _astar_id(nr, nc)
-					if not _astar.has_point(nid):
-						continue
 					if not _astar.are_points_connected(id, nid):
 						_astar.connect_points(id, nid)
 					
 					var pos_b : Vector3 = _astar.get_point_position(nid)
-					var neighbor_h : float = get_height(pos_b.x, pos_b.z)
-					var weight : float = 1 + max(0.0, neighbor_h - ground_level) * 0.5
+					var neighbor_h : float = 0.0
+					if noise:
+						neighbor_h = max(0.0, noise.get_noise_2d(pos_b.x, pos_b.z) * height)
+					var weight : float = 1.0 + neighbor_h * 0.08
 					_astar.set_point_weight_scale(nid, weight)
 
 func _dist_point_to_segment_2d(p: Vector2, a: Vector2, b: Vector2) -> float:
@@ -181,55 +251,131 @@ func _dist_point_to_segment_2d(p: Vector2, a: Vector2, b: Vector2) -> float:
 	return p.distance_to(a + ab * t)
 
 
-func _river_half_width_at_u(u: float) -> float:
+func _river_half_width_at_u(u: float, river_idx: int = 0) -> float:
 	var base_half: float = max(river_min_width * 0.5, river_width * 0.5)
 	if river_width_variation <= 0.0:
 		return base_half
 	var n: float = 0.0
 	if noise:
-		n = noise.get_noise_1d(u * river_width_noise_frequency + float(_seed) * 0.013)
+		n = noise.get_noise_1d(u * river_width_noise_frequency + float(_seed + river_idx * 131) * 0.013)
 	var width_scale: float = 1.0 + n * river_width_variation
 	return max(river_min_width * 0.5, base_half * width_scale)
 
 
 func _closest_river_info(xz: Vector2) -> Dictionary:
-	if _river_path.size() < 2:
-		return {"dist": INF, "u": 0.0}
+	if _river_paths.is_empty():
+		return {"dist": INF, "u": 0.0, "river_idx": -1}
 	var min_dist: float = INF
 	var best_u: float = 0.0
-	var denom: float = max(1.0, float(_river_path.size() - 1))
-	for i in _river_path.size() - 1:
-		var a := Vector2(_river_path[i].x, _river_path[i].z)
-		var b := Vector2(_river_path[i + 1].x, _river_path[i + 1].z)
-		var ab := b - a
-		var len_sq := ab.dot(ab)
-		var t: float = 0.0
-		if len_sq >= 0.0001:
-			t = clamp((xz - a).dot(ab) / len_sq, 0.0, 1.0)
-		var p := a + ab * t
-		var d := xz.distance_to(p)
-		if d < min_dist:
-			min_dist = d
-			best_u = (float(i) + t) / denom
-	return {"dist": min_dist, "u": best_u}
+	var best_idx: int = -1
+	for river_idx in _river_paths.size():
+		var river_path := _river_paths[river_idx]
+		if river_path.size() < 2:
+			continue
+		var denom: float = max(1.0, float(river_path.size() - 1))
+		for i in river_path.size() - 1:
+			var a := Vector2(river_path[i].x, river_path[i].z)
+			var b := Vector2(river_path[i + 1].x, river_path[i + 1].z)
+			var ab := b - a
+			var len_sq := ab.dot(ab)
+			var t: float = 0.0
+			if len_sq >= 0.0001:
+				t = clamp((xz - a).dot(ab) / len_sq, 0.0, 1.0)
+			var p := a + ab * t
+			var d := xz.distance_to(p)
+			if d < min_dist:
+				min_dist = d
+				best_u = (float(i) + t) / denom
+				best_idx = river_idx
+	return {"dist": min_dist, "u": best_u, "river_idx": best_idx}
 
 
-func _draw_road(path: PackedVector3Array) -> void:
+func _compute_river_influence_uncached(xz: Vector2) -> float:
+	if _river_paths.is_empty():
+		return 1.0
+	var river_info: Dictionary = _closest_river_info(xz)
+	var dist: float = float(river_info["dist"])
+	var river_idx: int = int(river_info["river_idx"])
+	if river_idx < 0:
+		return 1.0
+	var half_width: float = _river_half_width_at_u(float(river_info["u"]), river_idx)
+	var influence_radius: float = half_width + river_ground_band * river_terrain_influence
+	if dist >= influence_radius:
+		return 1.0
+	var t: float = clamp(dist / influence_radius, 0.0, 1.0)
+	return t * t * (3.0 - 2.0 * t)
+
+
+func _build_river_influence_cache() -> void:
+	var active_resolution: int = _get_active_resolution()
+	_river_cache_cols = active_resolution + 1
+	_river_cache_step = terrain_size / float(active_resolution)
+	_river_cache_half = terrain_size * 0.5
+	_river_influence_cache.resize(_river_cache_cols * _river_cache_cols)
+	for row in _river_cache_cols:
+		for col in _river_cache_cols:
+			var x := -_river_cache_half + col * _river_cache_step
+			var z := -_river_cache_half + row * _river_cache_step
+			var idx := row * _river_cache_cols + col
+			_river_influence_cache[idx] = _compute_river_influence_uncached(Vector2(x, z))
+	_river_cache_valid = true
+
+
+func _sample_river_influence(xz: Vector2) -> float:
+	if not _river_cache_valid or _river_cache_cols <= 1:
+		return _compute_river_influence_uncached(xz)
+	var gx: float = (xz.x + _river_cache_half) / _river_cache_step
+	var gz: float = (xz.y + _river_cache_half) / _river_cache_step
+	gx = clamp(gx, 0.0, float(_river_cache_cols - 1))
+	gz = clamp(gz, 0.0, float(_river_cache_cols - 1))
+	var x0: int = int(floor(gx))
+	var z0: int = int(floor(gz))
+	var x1: int = min(x0 + 1, _river_cache_cols - 1)
+	var z1: int = min(z0 + 1, _river_cache_cols - 1)
+	var tx: float = gx - float(x0)
+	var tz: float = gz - float(z0)
+	var i00: int = z0 * _river_cache_cols + x0
+	var i10: int = z0 * _river_cache_cols + x1
+	var i01: int = z1 * _river_cache_cols + x0
+	var i11: int = z1 * _river_cache_cols + x1
+	var v00: float = _river_influence_cache[i00]
+	var v10: float = _river_influence_cache[i10]
+	var v01: float = _river_influence_cache[i01]
+	var v11: float = _river_influence_cache[i11]
+	var vx0: float = lerpf(v00, v10, tx)
+	var vx1: float = lerpf(v01, v11, tx)
+	return lerpf(vx0, vx1, tz)
+
+
+func _apply_river_terrain_adaptation(base_height: float, xz: Vector2) -> float:
+	var t: float = _sample_river_influence(xz)
+	return lerpf(ground_level, base_height, t)
+
+
+func _draw_road(paths: Array[PackedVector3Array]) -> void:
 	var road := _get_or_create_marker("Road")
-	if path.size() < 2:
+	if paths.is_empty():
 		road.mesh = null
 		return
 
-	var lifted := PackedVector3Array()
-	for p in path:
-		lifted.append(Vector3(p.x, ground_level - river_depth, p.z))
-
 	var arrays := []
 	arrays.resize(ArrayMesh.ARRAY_MAX)
+	var lifted := PackedVector3Array()
+	for path in paths:
+		if path.size() < 2:
+			continue
+		for i in path.size() - 1:
+			var a := path[i]
+			var b := path[i + 1]
+			lifted.append(Vector3(a.x, ground_level - river_depth, a.z))
+			lifted.append(Vector3(b.x, ground_level - river_depth, b.z))
+	if lifted.is_empty():
+		road.mesh = null
+		return
 	arrays[ArrayMesh.ARRAY_VERTEX] = lifted
 
 	var arr_mesh := ArrayMesh.new()
-	arr_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_LINE_STRIP, arrays)
+	arr_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_LINES, arrays)
 
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color = Color(1, 1, 0)
@@ -276,47 +422,49 @@ func _make_river_curvier(path: PackedVector3Array) -> PackedVector3Array:
 	return _smooth_path_chaikin(curved, 1)
 
 
-func _draw_water(path: PackedVector3Array) -> void:
+func _draw_water(paths: Array[PackedVector3Array]) -> void:
 	var water := _get_or_create_marker("RiverWater")
-	if path.size() < 2:
+	if paths.is_empty():
 		water.mesh = null
 		return
 
 	var water_y  := ground_level - water_level_offset
-	var n        := path.size()
-
 	var verts   := PackedVector3Array()
 	var normals := PackedVector3Array()
 	var uvs     := PackedVector2Array()
 	var indices := PackedInt32Array()
-
-	for i in n:
-		var p := Vector3(path[i].x, water_y, path[i].z)
-
-		var fwd := Vector3.ZERO
-		if i < n - 1:
-			fwd += Vector3(path[i+1].x - path[i].x, 0.0, path[i+1].z - path[i].z)
-		if i > 0:
-			fwd += Vector3(path[i].x - path[i-1].x, 0.0, path[i].z - path[i-1].z)
-		if fwd.length_squared() < 0.0001:
-			fwd = Vector3.FORWARD
-		fwd = fwd.normalized()
-
-		var right := Vector3(-fwd.z, 0.0, fwd.x)
-
-		var u := float(i) / float(max(1, n - 1))
-		var half_w := _river_half_width_at_u(u)
-		verts.append(p - right * half_w)
-		verts.append(p + right * half_w)
-		normals.append(Vector3.UP)
-		normals.append(Vector3.UP)
-		uvs.append(Vector2(0.0, u))
-		uvs.append(Vector2(1.0, u))
-
-	for i in n - 1:
-		var base := i * 2
-		indices.append(base);     indices.append(base + 2); indices.append(base + 1)
-		indices.append(base + 1); indices.append(base + 2); indices.append(base + 3)
+	for river_idx in paths.size():
+		var path := paths[river_idx]
+		var n := path.size()
+		if n < 2:
+			continue
+		var base_vertex := verts.size()
+		for i in n:
+			var p := Vector3(path[i].x, water_y, path[i].z)
+			var fwd := Vector3.ZERO
+			if i < n - 1:
+				fwd += Vector3(path[i+1].x - path[i].x, 0.0, path[i+1].z - path[i].z)
+			if i > 0:
+				fwd += Vector3(path[i].x - path[i-1].x, 0.0, path[i].z - path[i-1].z)
+			if fwd.length_squared() < 0.0001:
+				fwd = Vector3.FORWARD
+			fwd = fwd.normalized()
+			var right := Vector3(-fwd.z, 0.0, fwd.x)
+			var u := float(i) / float(max(1, n - 1))
+			var half_w := _river_half_width_at_u(u, river_idx)
+			verts.append(p - right * half_w)
+			verts.append(p + right * half_w)
+			normals.append(Vector3.UP)
+			normals.append(Vector3.UP)
+			uvs.append(Vector2(0.0, u))
+			uvs.append(Vector2(1.0, u))
+		for i in n - 1:
+			var base := base_vertex + i * 2
+			indices.append(base);     indices.append(base + 2); indices.append(base + 1)
+			indices.append(base + 1); indices.append(base + 2); indices.append(base + 3)
+	if verts.is_empty():
+		water.mesh = null
+		return
 
 	var arrays := []
 	arrays.resize(ArrayMesh.ARRAY_MAX)
@@ -391,27 +539,33 @@ func _get_or_create_marker(marker_name: String) -> MeshInstance3D:
 
 
 func _find_road() -> void:
-	_road_path = []
-	_river_path = []
-	_road_points = [Vector3.ZERO, Vector3.ZERO]
-	var max_retries := 100
+	_river_paths.clear()
+	_river_points.clear()
+	var max_retries := 120
 	var rng := RandomNumberGenerator.new()
 	rng.seed = int(_seed)
+	for river_idx in river_count:
+		for _attempt in max_retries:
+			var points := get_random_edge_points(rng, true)
+			if _astar == null:
+				_river_points.append(points)
+				break
+			var a_id := _astar.get_closest_point(points[0])
+			var b_id := _astar.get_closest_point(points[1])
+			if a_id == -1 or b_id == -1:
+				continue
+			var path := _astar.get_point_path(a_id, b_id)
+			if path.size() > 0:
+				var final_path := _make_river_curvier(path)
+				_river_paths.append(final_path)
+				_river_points.append(points)
+				break
 
-	for _attempt in max_retries:
-		var points := get_random_edge_points(rng, true)
-		if _astar == null:
-			_road_points = points
-			break
-		var a_id := _astar.get_closest_point(points[0])
-		var b_id := _astar.get_closest_point(points[1])
-		if a_id == -1 or b_id == -1:
-			continue
-		_road_path = _astar.get_point_path(a_id, b_id)
-		if _road_path.size() > 0:
-			_river_path = _make_river_curvier(_road_path)
-			_road_points = points
-			break
+
+func _generate_river_layout() -> void:
+	build_astar()
+	_find_road()
+	_river_cache_valid = false
 
 
 func update_edge_marker() -> void:
@@ -428,25 +582,36 @@ func update_edge_marker() -> void:
 		mat.albedo_color = colors[i]
 		marker.material_override = mat
 		var xform := marker.transform
-		xform.origin = _road_points[i]
+		if _river_points.is_empty():
+			xform.origin = Vector3.ZERO
+		else:
+			var first_pair: Array = _river_points[0]
+			xform.origin = first_pair[i]
 		marker.transform = xform
 
-	_draw_road(_river_path)
-	_draw_water(_river_path)
+	_draw_road(_river_paths)
+	_draw_water(_river_paths)
 
 
 func _on_map_gen_button_pressed() -> void:
 	seed = randi()
 	update_mesh()
 
-func update_mesh() -> void:
+func update_mesh(regenerate_rivers: bool = true) -> void:
+	# If no noise, no generation
+	if noise == null:
+		return
 	_ensure_terrain_material()
-	build_astar()
-	_find_road()
+	var should_regen_rivers := regenerate_rivers and (not freeze_river_layout_for_testing or _river_paths.is_empty())
+	if should_regen_rivers:
+		_generate_river_layout()
+	elif _river_paths.is_empty():
+		_generate_river_layout()
 
 	var plane : PlaneMesh = PlaneMesh.new()
-	plane.subdivide_depth = resolution
-	plane.subdivide_width = resolution
+	var active_resolution: int = _get_active_resolution()
+	plane.subdivide_depth = active_resolution
+	plane.subdivide_width = active_resolution
 	plane.size = Vector2(terrain_size, terrain_size)
 
 	var plane_arrays := plane.get_mesh_arrays()
@@ -456,7 +621,7 @@ func update_mesh() -> void:
 	var uv_arrays : PackedVector2Array= plane_arrays[ArrayMesh.ARRAY_TEX_UV]
 
 	var river_floor    := ground_level - river_depth
-	var has_river      := _river_path.size() >= 2
+	var has_river      := not _river_paths.is_empty()
 
 	for i: int in vertex_arrays.size():
 		var vertex : Vector3 = vertex_arrays[i]
@@ -471,7 +636,8 @@ func update_mesh() -> void:
 		if has_river and noise:
 			var river_info : Dictionary = _closest_river_info(Vector2(vertex.x, vertex.z))
 			var dist: float = river_info["dist"]
-			var half_width : float = _river_half_width_at_u(river_info["u"])
+			var river_idx: int = int(river_info["river_idx"])
+			var half_width: float = _river_half_width_at_u(float(river_info["u"]), max(river_idx, 0))
 			
 			var height_diff : float = max(0.0, vertex.y - river_floor)
 
