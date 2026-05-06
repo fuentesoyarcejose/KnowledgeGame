@@ -74,6 +74,26 @@ var _gain := 0.5
 	get: return _gain
 	set(v): _gain = v; if noise: noise.fractal_gain = v; _queue_update_mesh()
 
+# ── Textures ──────────────────────────────────────────────────────────────────
+@export_group("Textures")
+@export var tex_low: Texture2D:
+	set(v): tex_low = v; if _terrain_material: _terrain_material.set_shader_parameter("texture_0", v)
+@export var tex_mid: Texture2D:
+	set(v): tex_mid = v; if _terrain_material: _terrain_material.set_shader_parameter("texture_1", v)
+@export var tex_high: Texture2D:
+	set(v): tex_high = v; if _terrain_material: _terrain_material.set_shader_parameter("texture_2", v)
+@export var tex_slope_low: Texture2D:
+	set(v): tex_slope_low = v; if _terrain_material: _terrain_material.set_shader_parameter("slope_tex_low", v)
+@export var tex_slope_high: Texture2D:
+	set(v): tex_slope_high = v; if _terrain_material: _terrain_material.set_shader_parameter("slope_tex_high", v)
+@export var tex_shore: Texture2D:
+	set(v): tex_shore = v; if _terrain_material: _terrain_material.set_shader_parameter("shore_texture", v)
+@export var tex_forest: Texture2D:
+	set(v): tex_forest = v; if _terrain_material: _terrain_material.set_shader_parameter("forest_texture", v)
+@export_range(0.1, 200.0, 0.1) var texture_scale: float = 20.0:
+	set(v): texture_scale = v; if _terrain_material: _terrain_material.set_shader_parameter("texture_scale", v)
+@export_group("")
+
 # ── Forest ────────────────────────────────────────────────────────────────────
 @export var forest_noise: FastNoiseLite:
 	set(v): forest_noise = v; if forest_noise and not forest_noise.changed.is_connected(_queue_update_mesh): forest_noise.changed.connect(_queue_update_mesh); _queue_update_mesh()
@@ -96,6 +116,10 @@ var _gain := 0.5
 
 # ── Shore ─────────────────────────────────────────────────────────────────────
 @export_range(0.1, 10.0, 0.1) var shore_width: float = 1.0
+
+# ── Play area ─────────────────────────────────────────────────────────────────
+@export_range(0.0, 400.0, 10.0) var play_area_margin: float = 200.0:
+	set(v): play_area_margin = v; _queue_update_mesh()
 
 # ── Debug ──────────────────────────────────────────────────────────────────────
 @export var show_biome_debug: bool = false:
@@ -169,6 +193,14 @@ func _ensure_terrain_material() -> void:
 	_terrain_material.set_shader_parameter("ground_level", ground_level)
 	_terrain_material.set_shader_parameter("shore_width", shore_width)
 	_terrain_material.set_shader_parameter("terrain_size", terrain_size)
+	_terrain_material.set_shader_parameter("texture_0", tex_low)
+	_terrain_material.set_shader_parameter("texture_1", tex_mid)
+	_terrain_material.set_shader_parameter("texture_2", tex_high)
+	_terrain_material.set_shader_parameter("slope_tex_low", tex_slope_low)
+	_terrain_material.set_shader_parameter("slope_tex_high", tex_slope_high)
+	_terrain_material.set_shader_parameter("shore_texture", tex_shore)
+	_terrain_material.set_shader_parameter("forest_texture", tex_forest)
+	_terrain_material.set_shader_parameter("texture_scale", texture_scale)
 
 
 # Single-sample height — fast path used by normal computation and edge sampling.
@@ -256,10 +288,16 @@ func get_biome(x: float, z: float) -> Biome:
 	var slope       := 1.0 - get_normal(x, z).y
 	var river_blend := _sample_carve_blend(Vector2(x, z))
 	if river_blend < 0.05:               return Biome.WATER
-	if river_blend < 0.2:                return Biome.SHORE
-	if slope > 0.1:                      return Biome.CLIFF
-	if h > ground_level + height * 0.10: return Biome.ROCKY
-	if forest_noise and (forest_noise.get_noise_2d(x, z) + _sample_forest_modifier(x, z)) > forest_threshold:
+	if river_blend < 0.1:                return Biome.SHORE
+	if slope > 0.10:                     return Biome.CLIFF
+	if h > ground_level + height * 0.1: return Biome.ROCKY
+	# Only allow forest where terrain is above the water surface.
+	# Compute the river_blend value that corresponds to the water mesh edge
+	# using the same smoothstep formula as _build_carve_cache.
+	var bf: float = clamp(1.0 - water_level_offset / maxf(0.001, river_depth), 0.0, 1.0)
+	var min_forest_blend: float = bf * bf * (3.0 - 2.0 * bf)
+	if forest_noise and river_blend >= min_forest_blend \
+			and (forest_noise.get_noise_2d(x, z) + _sample_forest_modifier(x, z)) > forest_threshold:
 		return Biome.FOREST
 	return Biome.PLAINS
 
@@ -283,28 +321,8 @@ func _sample_carve_blend(xz: Vector2) -> float:
 	return lerpf(lerpf(v00, v10, tx), lerpf(v01, v11, tx), tz)
 
 
-func _draw_road(paths: Array[PackedVector3Array]) -> void:
-	var road := _get_or_create_marker("Road") as MeshInstance3D
-	if paths.is_empty():
-		road.mesh = null
-		return
-	var lifted := PackedVector3Array()
-	for path in paths:
-		for i in path.size() - 1:
-			lifted.append(Vector3(path[i].x,     ground_level - river_depth, path[i].z))
-			lifted.append(Vector3(path[i + 1].x, ground_level - river_depth, path[i + 1].z))
-	if lifted.is_empty():
-		road.mesh = null
-		return
-	var arrays := []; arrays.resize(ArrayMesh.ARRAY_MAX)
-	arrays[ArrayMesh.ARRAY_VERTEX] = lifted
-	var arr_mesh := ArrayMesh.new()
-	arr_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_LINES, arrays)
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(1, 1, 0)
-	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	arr_mesh.surface_set_material(0, mat)
-	road.mesh = arr_mesh
+func _draw_road(_paths: Array[PackedVector3Array]) -> void:
+	(_get_or_create_marker("Road") as MeshInstance3D).mesh = null
 
 
 func _smooth_path_chaikin(path: PackedVector3Array, iterations: int = 4) -> PackedVector3Array:
@@ -354,8 +372,11 @@ func _draw_water_surface(paths: Array[PackedVector3Array]) -> void:
 			var right := Vector3(-fwd.z, 0.0, fwd.x)
 			var u := float(i) / float(max(1, n - 1))
 			var hw := _river_half_width_at_u(u, river_idx)
-			var pl := Vector2(path[i].x - right.x * hw, path[i].z - right.z * hw)
-			var pr := Vector2(path[i].x + right.x * hw, path[i].z + right.z * hw)
+			var bank: float = maxf(river_ground_band, hw * river_terrain_influence)
+			var bank_fill: float = clamp(1.0 - water_level_offset / maxf(0.001, river_depth), 0.0, 1.0)
+			var hw_water: float = hw + bank * bank_fill
+			var pl := Vector2(path[i].x - right.x * hw_water, path[i].z - right.z * hw_water)
+			var pr := Vector2(path[i].x + right.x * hw_water, path[i].z + right.z * hw_water)
 			cs_left.append(pl)
 			cs_right.append(pr)
 			cs_u.append(u)
@@ -388,11 +409,28 @@ func _draw_water_surface(paths: Array[PackedVector3Array]) -> void:
 
 	var mat := ShaderMaterial.new()
 	mat.shader = preload("res://RiverWater.gdshader")
-	mat.set_shader_parameter("flow_speed",      0.35)
-	mat.set_shader_parameter("flow_direction",  Vector2(1.0, 0.2))
-	mat.set_shader_parameter("tiling",          5.0)
-	mat.set_shader_parameter("depth_scale",     4.0)
-	mat.set_shader_parameter("normal_strength", 0.65)
+
+	var _make_noise_tex := func(freq: float, as_normal: bool, cellular: bool) -> NoiseTexture2D:
+		var fnl := FastNoiseLite.new()
+		fnl.noise_type = FastNoiseLite.TYPE_CELLULAR if cellular else FastNoiseLite.TYPE_SIMPLEX_SMOOTH
+		fnl.frequency = freq
+		var tex := NoiseTexture2D.new()
+		tex.noise = fnl
+		tex.seamless = true
+		tex.width = 128
+		tex.height = 128
+		tex.as_normal_map = as_normal
+		return tex
+
+	mat.set_shader_parameter("normal_map_a",         _make_noise_tex.call(0.03, true,  false))
+	mat.set_shader_parameter("normal_map_b",         _make_noise_tex.call(0.07, true,  false))
+	mat.set_shader_parameter("foam_texture",         _make_noise_tex.call(0.05, false, true))
+	mat.set_shader_parameter("flow_speed",           0.35)
+	mat.set_shader_parameter("flow_direction",       Vector2(1.0, 0.2))
+	mat.set_shader_parameter("tiling",               5.0)
+	mat.set_shader_parameter("depth_scale",          4.0)
+	mat.set_shader_parameter("normal_strength",      1.2)
+	mat.set_shader_parameter("refraction_strength",  0.025)
 	arr_mesh.surface_set_material(0, mat)
 	water.mesh = arr_mesh
 
@@ -498,23 +536,70 @@ func _generate_river_layout() -> void:
 	_build_carve_cache()
 
 
+func _draw_boundary() -> void:
+	var bnd := _get_or_create_marker("Boundary") as MeshInstance3D
+	var play_half := (terrain_size - play_area_margin) * 0.5
+	if play_half <= 0.0:
+		bnd.mesh = null
+		return
+
+	const WALL_H   := 5.0
+	const STEP     := 10.0
+
+	var verts   := PackedVector3Array()
+	var normals := PackedVector3Array()
+	var indices := PackedInt32Array()
+
+	# Four edges: (start, end) in XZ plane
+	var edges: Array = [
+		[Vector2(-play_half, -play_half), Vector2( play_half, -play_half)],
+		[Vector2( play_half, -play_half), Vector2( play_half,  play_half)],
+		[Vector2( play_half,  play_half), Vector2(-play_half,  play_half)],
+		[Vector2(-play_half,  play_half), Vector2(-play_half, -play_half)],
+	]
+
+	for edge in edges:
+		var a: Vector2 = edge[0]
+		var b: Vector2 = edge[1]
+		var steps: int = max(1, int(ceil((b - a).length() / STEP)))
+		for i in steps:
+			var t0 := float(i)     / float(steps)
+			var t1 := float(i + 1) / float(steps)
+			var p0 := a.lerp(b, t0)
+			var p1 := a.lerp(b, t1)
+			var h0 := get_height(p0.x, p0.y)
+			var h1 := get_height(p1.x, p1.y)
+			var base := verts.size()
+			verts.append(Vector3(p0.x, h0,          p0.y))
+			verts.append(Vector3(p1.x, h1,          p1.y))
+			verts.append(Vector3(p0.x, h0 + WALL_H, p0.y))
+			verts.append(Vector3(p1.x, h1 + WALL_H, p1.y))
+			normals.append(Vector3.UP); normals.append(Vector3.UP)
+			normals.append(Vector3.UP); normals.append(Vector3.UP)
+			indices.append(base);     indices.append(base + 2); indices.append(base + 1)
+			indices.append(base + 1); indices.append(base + 2); indices.append(base + 3)
+
+	var arrays := []; arrays.resize(ArrayMesh.ARRAY_MAX)
+	arrays[ArrayMesh.ARRAY_VERTEX] = verts
+	arrays[ArrayMesh.ARRAY_NORMAL] = normals
+	arrays[ArrayMesh.ARRAY_INDEX]  = indices
+	var arr_mesh := ArrayMesh.new()
+	arr_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(1.0, 0.5, 0.0, 0.75)
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.cull_mode    = BaseMaterial3D.CULL_DISABLED
+	arr_mesh.surface_set_material(0, mat)
+	bnd.mesh = arr_mesh
+
+
 func update_edge_marker() -> void:
-	var colors := [Color(1, 0, 0), Color(0, 0, 1)]
-	var names  := ["EdgeMarker", "EdgeMarker2"]
-	for i in 2:
-		var marker := _get_or_create_marker(names[i]) as MeshInstance3D
-		if not marker.mesh:
-			var sphere := SphereMesh.new()
-			sphere.radius = terrain_size * 0.01
-			marker.mesh = sphere
-		var mat := StandardMaterial3D.new()
-		mat.albedo_color = colors[i]
-		marker.material_override = mat
-		var xform := marker.transform
-		xform.origin = Vector3.ZERO if _river_points.is_empty() else (_river_points[0] as Array)[i]
-		marker.transform = xform
+	for name in ["EdgeMarker", "EdgeMarker2"]:
+		(_get_or_create_marker(name) as MeshInstance3D).mesh = null
 	_draw_road(_river_paths)
 	_draw_water_surface(_river_paths)
+	_draw_boundary()
 
 
 func _build_biome_texture() -> void:
@@ -616,6 +701,12 @@ func _refresh_biome_texture() -> void:
 		_terrain_material.set_shader_parameter("biome_texture", _biome_texture)
 
 
+func refresh_prop_layers() -> void:
+	for child in get_children():
+		if child is PropLayer:
+			child.refresh(self)
+
+
 func _on_map_gen_button_pressed() -> void:
 	seed = randi()
 	update_mesh()
@@ -675,3 +766,4 @@ func update_mesh(regenerate_rivers: bool = true) -> void:
 	_update_biome_debug_overlay()
 	if _terrain_material and _biome_texture:
 		_terrain_material.set_shader_parameter("biome_texture", _biome_texture)
+	refresh_prop_layers()
