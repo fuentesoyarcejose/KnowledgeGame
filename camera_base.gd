@@ -17,6 +17,7 @@ extends Node3D
 
 # ── Mouse rotation ────────────────────────────────────────────────────────────
 @export_range(0.01, 2.0, 0.01) var mouse_rotate_sensitivity: float = 0.3
+@export_range(0.001, 0.05, 0.001) var mouse_pan_sensitivity: float = 0.005
 
 # ── Flags ─────────────────────────────────────────────────────────────────────
 var cameraCanProcess:  bool = true
@@ -31,6 +32,7 @@ var cameraCanZoom:     bool = true
 var _target_arm:   float = 0.0
 var _current_arm:  float = 0.0
 var _mmb_held:     bool  = false
+var _rmb_held:     bool  = false
 var _current_pitch: float = 0.0
 var _terrain: TerrainMesh = null
 
@@ -52,9 +54,22 @@ func _unhandled_input(event: InputEvent) -> void:
 				_target_arm = clamp(_target_arm * (1.0 + zoom_factor), arm_min, arm_max)
 			MOUSE_BUTTON_MIDDLE:
 				_mmb_held = true
+			MOUSE_BUTTON_RIGHT:
+				_rmb_held = true
 	if event is InputEventMouseButton and not event.pressed:
 		if event.button_index == MOUSE_BUTTON_MIDDLE:
 			_mmb_held = false
+		if event.button_index == MOUSE_BUTTON_RIGHT:
+			_rmb_held = false
+
+	if event is InputEventMouseMotion and _rmb_held:
+		var pan: float = _current_arm * mouse_pan_sensitivity
+		position -= transform.basis.x * event.relative.x * pan
+		position += transform.basis.z * event.relative.y * pan
+		if _terrain:
+			var play_half := (_terrain.terrain_size - _terrain.play_area_margin) * 0.5
+			position.x = clamp(position.x, -play_half, play_half)
+			position.z = clamp(position.z, -play_half, play_half)
 
 	if event is InputEventMouseMotion and _mmb_held:
 		rotation_degrees.y -= event.relative.x * mouse_rotate_sensitivity
