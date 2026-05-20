@@ -2,7 +2,9 @@
 extends MeshInstance3D
 class_name TerrainMesh
 
-@export var terrain_shader: Shader = preload("res://terrainShader.gdshader")
+signal terrain_generated
+
+@export var terrain_shader: Shader = preload("res://world/terrainShader.gdshader")
 var _terrain_material: ShaderMaterial = null
 const EDITOR_REBUILD_DEBOUNCE_SEC: float = 0.2
 var _editor_rebuild_timer: Timer = null
@@ -54,7 +56,7 @@ var _generate_height_only := false
 	set(v):
 		height = v
 		if _terrain_material:
-			_terrain_material.set_shader_parameter("height", height * 2.0)
+			_terrain_material.set_shader_parameter("height", height)
 		_queue_update_mesh()
 
 @export_range(-256.0, 256.0, 1.0) var ground_level: float = 0.0
@@ -90,8 +92,24 @@ var _gain := 0.5
 	set(v): tex_shore = v; if _terrain_material: _terrain_material.set_shader_parameter("shore_texture", v)
 @export var tex_forest: Texture2D:
 	set(v): tex_forest = v; if _terrain_material: _terrain_material.set_shader_parameter("forest_texture", v)
+@export var tex_plains_alt: Texture2D:
+	set(v): tex_plains_alt = v; if _terrain_material: _terrain_material.set_shader_parameter("texture_1b", v)
 @export_range(0.1, 200.0, 0.1) var texture_scale: float = 20.0:
 	set(v): texture_scale = v; if _terrain_material: _terrain_material.set_shader_parameter("texture_scale", v)
+@export_range(10.0, 800.0, 5.0) var plains_var_scale: float = 120.0:
+	set(v): plains_var_scale = v; if _terrain_material: _terrain_material.set_shader_parameter("plains_var_scale", v)
+@export_range(0.5, 8.0, 0.1) var plains_var_contrast: float = 3.0:
+	set(v): plains_var_contrast = v; if _terrain_material: _terrain_material.set_shader_parameter("plains_var_contrast", v)
+@export_group("")
+
+# ── Navigation ────────────────────────────────────────────────────────────────
+@export_group("Navigation")
+@export_range(0.5, 10.0, 0.5) var nav_cell_size: float = 2.0:
+	set(v):
+		nav_cell_size = v
+		if _nav_region and _nav_region.navigation_mesh:
+			_nav_region.navigation_mesh.cell_size = v
+			_bake_nav_mesh()
 @export_group("")
 
 # ── Forest ────────────────────────────────────────────────────────────────────
@@ -123,7 +141,12 @@ var _gain := 0.5
 
 # ── Debug ──────────────────────────────────────────────────────────────────────
 @export var show_biome_debug: bool = false:
-	set(v): show_biome_debug = v; _queue_update_mesh()
+	set(v):
+		show_biome_debug = v
+		if Engine.is_editor_hint():
+			_queue_update_mesh()
+		else:
+			_update_biome_debug_overlay()
 
 # ── Seed ──────────────────────────────────────────────────────────────────────
 var _seed: int = 0
@@ -145,7 +168,10 @@ var _carve_cache: PackedFloat32Array = PackedFloat32Array()
 var _forest_modifier: PackedFloat32Array = PackedFloat32Array()
 var _carve_step: float = 0.0
 var _carve_half: float = 0.0
-var _biome_texture: ImageTexture = null
+var _biome_texture:  ImageTexture    = null
+var _nav_region:     NavigationRegion3D = null
+var _terrain_body:   StaticBody3D    = null
+var _terrain_cshape: CollisionShape3D = null
 
 enum Biome { WATER, SHORE, FOREST, PLAINS, ROCKY, CLIFF }
 
@@ -159,6 +185,56 @@ func _ready() -> void:
 			add_child(_editor_rebuild_timer)
 		if not _editor_rebuild_timer.timeout.is_connected(_on_editor_rebuild_timeout):
 			_editor_rebuild_timer.timeout.connect(_on_editor_rebuild_timeout)
+		return
+	# Apply map generation options stored by the options screen before the first build.
+	# Set backing vars directly to avoid triggering extra update_mesh calls per setter.
+	var any_meta := false
+	if get_tree().has_meta("map_seed"):
+		_seed = int(get_tree().get_meta("map_seed"))
+		if noise: noise.seed = _seed
+		get_tree().remove_meta("map_seed")
+		any_meta = true
+	if get_tree().has_meta("map_river_count"):
+		river_count = int(get_tree().get_meta("map_river_count"))
+		get_tree().remove_meta("map_river_count")
+		any_meta = true
+	if get_tree().has_meta("map_height"):
+		height = float(get_tree().get_meta("map_height"))
+		get_tree().remove_meta("map_height")
+		any_meta = true
+	if any_meta:
+		update_mesh()
+
+	# Register with the Debug singleton so the HUD can read seed/biome.
+	var _dbg := get_node_or_null("/root/Debug")
+	if _dbg:
+		_dbg.set("_terrain", self)
+		_dbg.connect("toggled", _on_debug_toggled)
+
+	if not get_parent().has_node("BuildGrid"):
+		var grid: Node = load("res://building/build_grid.gd").new()
+		grid.name = "BuildGrid"
+		get_parent().call_deferred("add_child", grid)
+
+	if not get_parent().has_node("GameHUD"):
+		var hud: Node = load("res://ui/game_hud.gd").new()
+		hud.name = "GameHUD"
+		get_parent().call_deferred("add_child", hud)
+
+	if not get_parent().has_node("ColonyManager"):
+		var mgr: Node = load("res://colony/colony_manager.gd").new()
+		mgr.name = "ColonyManager"
+		get_parent().call_deferred("add_child", mgr)
+
+	# Bake nav mesh over the already-generated terrain (skipped if update_mesh handles it).
+	if not any_meta:
+		call_deferred("_bake_nav_mesh")
+
+
+
+func _on_debug_toggled(dbg: bool) -> void:
+	if not dbg:
+		show_biome_debug = false
 
 
 func _on_editor_rebuild_timeout() -> void:
@@ -189,7 +265,7 @@ func _ensure_terrain_material() -> void:
 		_terrain_material = ShaderMaterial.new()
 	if _terrain_material.shader != terrain_shader:
 		_terrain_material.shader = terrain_shader
-	_terrain_material.set_shader_parameter("height", height * 2.0)
+	_terrain_material.set_shader_parameter("height", height)
 	_terrain_material.set_shader_parameter("ground_level", ground_level)
 	_terrain_material.set_shader_parameter("shore_width", shore_width)
 	_terrain_material.set_shader_parameter("terrain_size", terrain_size)
@@ -200,7 +276,10 @@ func _ensure_terrain_material() -> void:
 	_terrain_material.set_shader_parameter("slope_tex_high", tex_slope_high)
 	_terrain_material.set_shader_parameter("shore_texture", tex_shore)
 	_terrain_material.set_shader_parameter("forest_texture", tex_forest)
+	_terrain_material.set_shader_parameter("texture_1b", tex_plains_alt)
 	_terrain_material.set_shader_parameter("texture_scale", texture_scale)
+	_terrain_material.set_shader_parameter("plains_var_scale", plains_var_scale)
+	_terrain_material.set_shader_parameter("plains_var_contrast", plains_var_contrast)
 
 
 # Single-sample height — fast path used by normal computation and edge sampling.
@@ -408,7 +487,7 @@ func _draw_water_surface(paths: Array[PackedVector3Array]) -> void:
 	arr_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 
 	var mat := ShaderMaterial.new()
-	mat.shader = preload("res://RiverWater.gdshader")
+	mat.shader = preload("res://world/RiverWater.gdshader")
 
 	var _make_noise_tex := func(freq: float, as_normal: bool, cellular: bool) -> NoiseTexture2D:
 		var fnl := FastNoiseLite.new()
@@ -694,6 +773,24 @@ func reset_forest_modifiers() -> void:
 	_refresh_biome_texture()
 
 
+# Permanently suppresses the forest biome at each world-XZ position by writing
+# a large negative value into the forest modifier grid.  A single call handles
+# an entire area without rebuilding the mesh.
+func deforest_cells(world_positions: Array) -> void:
+	_init_forest_modifier()
+	if _carve_step == 0.0:
+		return
+	var cols := _CARVE_RES + 1
+	for pos in world_positions:
+		var v    := pos as Vector2
+		var gx_c := int(clamp((v.x + _carve_half) / _carve_step, 0.0, float(cols - 1)))
+		var gz_c := int(clamp((v.y + _carve_half) / _carve_step, 0.0, float(cols - 1)))
+		for dz in range(-2, 3):
+			for dx in range(-2, 3):
+				_forest_modifier[clampi(gz_c + dz, 0, cols - 1) * cols + clampi(gx_c + dx, 0, cols - 1)] = -3.0
+	_refresh_biome_texture()
+
+
 func _refresh_biome_texture() -> void:
 	_build_biome_texture()
 	_update_biome_debug_overlay()
@@ -760,10 +857,65 @@ func update_mesh(regenerate_rivers: bool = true) -> void:
 	mesh = array_mesh
 	if _terrain_material:
 		material_override = _terrain_material
+	if not Engine.is_editor_hint():
+		_update_terrain_collision(array_mesh)
 	update_edge_marker()
-	_init_forest_modifier()
+	var fm_cols := _CARVE_RES + 1
+	_forest_modifier.resize(fm_cols * fm_cols)
+	_forest_modifier.fill(0.0)
 	_build_biome_texture()
 	_update_biome_debug_overlay()
 	if _terrain_material and _biome_texture:
 		_terrain_material.set_shader_parameter("biome_texture", _biome_texture)
 	refresh_prop_layers()
+	if not Engine.is_editor_hint():
+		terrain_generated.emit()
+		_bake_nav_mesh()
+
+
+# ── Navigation ────────────────────────────────────────────────────────────────
+
+func _ensure_nav_region() -> void:
+	if _nav_region and is_instance_valid(_nav_region):
+		return
+	if not is_inside_tree():
+		return
+	var nav_mesh := NavigationMesh.new()
+	nav_mesh.geometry_parsed_geometry_type   = NavigationMesh.PARSED_GEOMETRY_MESH_INSTANCES
+	nav_mesh.agent_height    = 2.0
+	nav_mesh.agent_radius    = 0.5
+	nav_mesh.agent_max_slope = 40.0
+	nav_mesh.agent_max_climb = 0.5
+	nav_mesh.cell_size       = nav_cell_size
+	nav_mesh.cell_height     = 0.5
+	nav_mesh.filter_low_hanging_obstacles    = true
+	nav_mesh.filter_walkable_low_height_spans = true
+	_nav_region = NavigationRegion3D.new()
+	_nav_region.name            = "NavigationRegion"
+	_nav_region.navigation_mesh = nav_mesh
+	get_parent().add_child(_nav_region)
+
+
+func _bake_nav_mesh() -> void:
+	if Engine.is_editor_hint():
+		return
+	_ensure_nav_region()
+	if _nav_region:
+		_nav_region.call_deferred("bake_navigation_mesh", true)
+
+
+func get_terrain_body_rid() -> RID:
+	if _terrain_body and is_instance_valid(_terrain_body):
+		return _terrain_body.get_rid()
+	return RID()
+
+
+func _update_terrain_collision(arr_mesh: ArrayMesh) -> void:
+	if _terrain_body == null or not is_instance_valid(_terrain_body):
+		_terrain_body  = StaticBody3D.new()
+		_terrain_cshape = CollisionShape3D.new()
+		_terrain_body.add_child(_terrain_cshape)
+		add_child(_terrain_body)
+	var shape := ConcavePolygonShape3D.new()
+	shape.set_faces(arr_mesh.get_faces())
+	_terrain_cshape.shape = shape

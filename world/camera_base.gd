@@ -1,4 +1,5 @@
 extends Node3D
+class_name CameraBase
 
 # ── Movement ──────────────────────────────────────────────────────────────────
 @export_range(1.0, 200.0, 1.0) var cameraMoveSpeed: float = 100.0
@@ -18,6 +19,7 @@ extends Node3D
 # ── Mouse rotation ────────────────────────────────────────────────────────────
 @export_range(0.01, 2.0, 0.01) var mouse_rotate_sensitivity: float = 0.3
 @export_range(0.001, 0.05, 0.001) var mouse_pan_sensitivity: float = 0.005
+@export_range(0.0, 20.0, 0.5) var min_terrain_clearance: float = 2.0
 
 # ── Flags ─────────────────────────────────────────────────────────────────────
 var cameraCanProcess:  bool = true
@@ -43,6 +45,7 @@ func _ready() -> void:
 	_target_arm    = sqrt(arm_min * arm_max)  # geometric midpoint
 	_current_arm   = _target_arm
 	_apply_zoom()
+	Debug._camera = self
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -70,6 +73,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			var play_half := (_terrain.terrain_size - _terrain.play_area_margin) * 0.5
 			position.x = clamp(position.x, -play_half, play_half)
 			position.z = clamp(position.z, -play_half, play_half)
+		_clamp_above_terrain()
 
 	if event is InputEventMouseMotion and _mmb_held:
 		rotation_degrees.y -= event.relative.x * mouse_rotate_sensitivity
@@ -101,6 +105,7 @@ func _camera_pan(delta: float) -> void:
 		var play_half := (_terrain.terrain_size - _terrain.play_area_margin) * 0.5
 		position.x = clamp(position.x, -play_half, play_half)
 		position.z = clamp(position.z, -play_half, play_half)
+	_clamp_above_terrain()
 
 
 func _camera_rotate(delta: float) -> void:
@@ -115,6 +120,21 @@ func _camera_zoom(delta: float) -> void:
 		return
 	_current_arm = lerpf(_current_arm, _target_arm, zoom_smooth * delta)
 	_apply_zoom()
+
+
+func pan_to(world_pos: Vector3) -> void:
+	position.x = world_pos.x
+	position.z = world_pos.z
+	if _terrain:
+		var play_half := (_terrain.terrain_size - _terrain.play_area_margin) * 0.5
+		position.x = clamp(position.x, -play_half, play_half)
+		position.z = clamp(position.z, -play_half, play_half)
+	_clamp_above_terrain()
+
+
+func _clamp_above_terrain() -> void:
+	if _terrain:
+		position.y = maxf(position.y, _terrain.get_height(position.x, position.z) + min_terrain_clearance)
 
 
 func _apply_zoom() -> void:

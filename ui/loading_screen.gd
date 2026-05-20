@@ -1,6 +1,6 @@
 extends Control
 
-const TARGET_SCENE := "res://terrain_generation.tscn"
+const TARGET_SCENE := "res://scenes/terrain_generation.tscn"
 
 @onready var progress_bar: ProgressBar = $CenterContainer/VBoxContainer/ProgressBar
 @onready var status_label: Label       = $CenterContainer/VBoxContainer/Status
